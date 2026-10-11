@@ -1,4 +1,4 @@
-name: Six
+name: ch
 
 on:
   workflow_dispatch:
