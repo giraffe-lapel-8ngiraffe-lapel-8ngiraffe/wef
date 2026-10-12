@@ -3,21 +3,25 @@ name: CI
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 * * * *'
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-receiver
+  cancel-in-progress: false
+
 jobs:
   receiver:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 58
 
     steps:
       - name: Version marker
         shell: pwsh
         run: |
-          Write-Host "=== RECEIVER v11 (schedule 6h, token-file) ==="
+          Write-Host "=== RECEIVER v12 (schedule 1h, 55min lifetime, token-file) ==="
 
       - name: Download cloudflared
         shell: pwsh
@@ -81,6 +85,10 @@ jobs:
           $listener.Prefixes.Add("http://127.0.0.1:8080/")
           $listener.Start()
 
+          # Живём ~55 минут, чтобы успеть корректно завершиться до timeout-minutes: 58
+          $deadline = (Get-Date).AddMinutes(55)
+          Write-Host "[lifecycle] deadline: $deadline"
+
           $script:runningProc = $null
           $script:outFile     = Join-Path $workDir "stdout.txt"
           $script:errFile     = Join-Path $workDir "stderr.txt"
@@ -110,7 +118,23 @@ jobs:
 
           try {
               while ($true) {
-                  $ctx = $listener.GetContext()
+                  if ((Get-Date) -ge $deadline) {
+                      Write-Host "[lifecycle] deadline reached, shutting down"
+                      break
+                  }
+
+                  # Асинхронное ожидание запроса, чтобы иметь возможность проверять дедлайн
+                  $ctxTask = $listener.GetContextAsync()
+                  while (-not $ctxTask.AsyncWaitHandle.WaitOne(1000)) {
+                      if ((Get-Date) -ge $deadline) {
+                          Write-Host "[lifecycle] deadline reached while waiting for request"
+                          $listener.Stop()
+                          break
+                      }
+                  }
+                  if ((Get-Date) -ge $deadline) { break }
+
+                  $ctx = $ctxTask.Result
                   $req = $ctx.Request
                   $res = $ctx.Response
                   $body = ""
@@ -233,6 +257,12 @@ jobs:
               }
           }
           finally {
-              $listener.Stop(); $listener.Close()
-              if ($cf -and -not $cf.HasExited) { $cf.Kill() }
+              Write-Host "[lifecycle] entering shutdown"
+              try { Stop-Running } catch { Write-Host "!! stop-running failed: $($_.Exception.Message)" }
+              try { $listener.Stop(); $listener.Close() } catch {}
+              if ($cf -and -not $cf.HasExited) {
+                  Write-Host "[lifecycle] killing cloudflared PID=$($cf.Id)"
+                  try { $cf.Kill() } catch {}
+              }
+              Write-Host "[lifecycle] shutdown complete"
           }
