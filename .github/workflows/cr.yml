@@ -3,33 +3,29 @@ name: CI
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 */6 * * *'
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-receiver
-  cancel-in-progress: false
-
 jobs:
   receiver:
     runs-on: windows-latest
-    timeout-minutes: 58
+    timeout-minutes: 350
 
     steps:
       - name: Version marker
         shell: pwsh
         run: |
-          Write-Host "=== RECEIVER v12 (schedule 1h, 55min lifetime, token-file) ==="
+          Write-Host "=== RECEIVER v12 (supervisor auto-restart) ==="
 
-      - name: Download cloudflared
+      - name: Download
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
             -OutFile "$env:RUNNER_TEMP\cloudflared.exe"
 
-      - name: Start listener with named tunnel
+      - name: Start listener with named
         shell: pwsh
         env:
           SHARED_SECRET:   ${{ secrets.SECRET }}
@@ -85,13 +81,22 @@ jobs:
           $listener.Prefixes.Add("http://127.0.0.1:8080/")
           $listener.Start()
 
-          # Живём ~55 минут, чтобы успеть корректно завершиться до timeout-minutes: 58
-          $deadline = (Get-Date).AddMinutes(55)
+          # Жёсткий дедлайн для мягкого завершения.
+          # Актуален только при timeout-minutes: 58. Для 350 можно поставить больше
+          # (например, AddMinutes(340)) или вообще убрать проверку.
+          $deadline = (Get-Date).AddMinutes(340)
           Write-Host "[lifecycle] deadline: $deadline"
 
           $script:runningProc = $null
           $script:outFile     = Join-Path $workDir "stdout.txt"
           $script:errFile     = Join-Path $workDir "stderr.txt"
+
+          # --- supervisor state ---
+          $script:lastCmd        = $null   # путь к exe, который надо перезапускать
+          $script:lastCwd        = $null   # рабочая директория
+          $script:restarts       = 0
+          $script:maxRestart     = 10      # максимум перезапусков за сессию
+          $script:restartDelay   = 10      # сек между падением и рестартом
 
           function Remove-MacJunk {
             param([string]$Dir)
@@ -107,13 +112,51 @@ jobs:
                 ForEach-Object { Remove-Item $_.FullName -Recurse -Force -EA SilentlyContinue }
             Remove-Item $Dir -Recurse -Force -EA SilentlyContinue
           }
+
           function Stop-Running {
+            param([switch]$ClearAuto)
             if ($script:runningProc -and -not $script:runningProc.HasExited) {
                 Write-Host "[stop] killing PID=$($script:runningProc.Id)"
                 try { $script:runningProc.Kill() } catch {}
                 Start-Sleep -Seconds 2
             }
             $script:runningProc = $null
+            if ($ClearAuto) {
+                $script:lastCmd  = $null
+                $script:lastCwd  = $null
+                $script:restarts = 0
+                Write-Host "[stop] auto-restart disabled"
+            }
+          }
+
+          function Invoke-Watchdog {
+            if (-not $script:lastCmd) { return }
+            if (-not $script:runningProc) { return }
+            if (-not $script:runningProc.HasExited) { return }
+
+            if ($script:restarts -ge $script:maxRestart) {
+                Write-Host "[watchdog] restart limit reached ($($script:maxRestart)), disabling auto-restart"
+                $script:lastCmd = $null
+                return
+            }
+
+            $exitCode = $script:runningProc.ExitCode
+            $script:restarts++
+            Write-Host "[watchdog] PID=$($script:runningProc.Id) exited code=$exitCode, restart #$($script:restarts)/$($script:maxRestart) in $($script:restartDelay)s"
+            Start-Sleep -Seconds $script:restartDelay
+
+            Remove-Item $script:outFile,$script:errFile -Force -EA SilentlyContinue
+            try {
+                $script:runningProc = Start-Process -FilePath $script:lastCmd `
+                    -WorkingDirectory $script:lastCwd `
+                    -RedirectStandardOutput $script:outFile `
+                    -RedirectStandardError  $script:errFile `
+                    -PassThru
+                Write-Host "[watchdog] restarted PID=$($script:runningProc.Id)"
+            } catch {
+                Write-Host "[watchdog] restart failed: $($_.Exception.Message)"
+                $script:lastCmd = $null
+            }
           }
 
           try {
@@ -123,9 +166,10 @@ jobs:
                       break
                   }
 
-                  # Асинхронное ожидание запроса, чтобы иметь возможность проверять дедлайн
+                  # Неблокирующее ожидание запроса, чтобы watchdog успевал срабатывать
                   $ctxTask = $listener.GetContextAsync()
                   while (-not $ctxTask.AsyncWaitHandle.WaitOne(1000)) {
+                      Invoke-Watchdog
                       if ((Get-Date) -ge $deadline) {
                           Write-Host "[lifecycle] deadline reached while waiting for request"
                           $listener.Stop()
@@ -133,6 +177,7 @@ jobs:
                       }
                   }
                   if ((Get-Date) -ge $deadline) { break }
+                  if (-not $ctxTask.IsCompleted) { continue }
 
                   $ctx = $ctxTask.Result
                   $req = $ctx.Request
@@ -158,7 +203,9 @@ jobs:
                                   $appUrl   = $data.app_url   -replace 'dl=0','dl=1'
                                   $stateUrl = $data.state_url -replace 'dl=0','dl=1'
 
-                                  Stop-Running
+                                  # гасим текущий процесс и отключаем авто-рестарт —
+                                  # сейчас приедет новый билд, старый exe уже неактуален
+                                  Stop-Running -ClearAuto
 
                                   $appZip = Join-Path $workDir "hits.zip"
                                   Safe-RemoveDir -Dir $appDir
@@ -211,7 +258,13 @@ jobs:
                                               -RedirectStandardOutput $script:outFile `
                                               -RedirectStandardError  $script:errFile `
                                               -PassThru
-                                          Write-Host "[execute] started PID=$($script:runningProc.Id) cwd=$workPath"
+
+                                          # включаем авто-рестарт для этого exe
+                                          $script:lastCmd  = $exe.FullName
+                                          $script:lastCwd  = $workPath
+                                          $script:restarts = 0
+
+                                          Write-Host "[execute] started PID=$($script:runningProc.Id) cwd=$workPath (auto-restart ON, max=$($script:maxRestart))"
                                           $res.StatusCode = 200; $body = "Started PID=$($script:runningProc.Id)"
                                       }
                                   }
@@ -221,9 +274,10 @@ jobs:
                                   if (-not $script:runningProc) {
                                       $res.StatusCode = 200; $body = "Not started"
                                   } elseif ($script:runningProc.HasExited) {
-                                      $res.StatusCode = 200; $body = "Exited with code $($script:runningProc.ExitCode)"
+                                      $res.StatusCode = 200
+                                      $body = "Exited with code $($script:runningProc.ExitCode) (restarts $($script:restarts)/$($script:maxRestart), auto=$([bool]$script:lastCmd))"
                                   } else {
-                                      $res.StatusCode = 200; $body = "Running PID=$($script:runningProc.Id)"
+                                      $res.StatusCode = 200; $body = "Running PID=$($script:runningProc.Id) (restarts $($script:restarts)/$($script:maxRestart))"
                                   }
                               }
 
@@ -234,7 +288,7 @@ jobs:
                                   $body = "--- STDOUT ---`n$stdout`n--- STDERR ---`n$stderr"
                               }
 
-                              "/stop" { Stop-Running; $res.StatusCode = 200; $body = "Stopped" }
+                              "/stop" { Stop-Running -ClearAuto; $res.StatusCode = 200; $body = "Stopped" }
 
                               default { $res.StatusCode = 404; $body = "Not found" }
                           }
@@ -257,12 +311,8 @@ jobs:
               }
           }
           finally {
-              Write-Host "[lifecycle] entering shutdown"
-              try { Stop-Running } catch { Write-Host "!! stop-running failed: $($_.Exception.Message)" }
+              Write-Host "[lifecycle] shutdown"
+              try { Stop-Running } catch {}
               try { $listener.Stop(); $listener.Close() } catch {}
-              if ($cf -and -not $cf.HasExited) {
-                  Write-Host "[lifecycle] killing cloudflared PID=$($cf.Id)"
-                  try { $cf.Kill() } catch {}
-              }
-              Write-Host "[lifecycle] shutdown complete"
+              if ($cf -and -not $cf.HasExited) { $cf.Kill() }
           }
